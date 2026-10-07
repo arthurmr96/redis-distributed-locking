@@ -69,7 +69,7 @@ export async function markComplete(lock: Lock, redisClient: RedisClientType): Pr
   return result === 1;
 }
 
-export async function renew(lock: Lock, ttl: number, redisClient: RedisClientType): Promise<void> {
+export async function renew(lock: Lock, ttl: number, redisClient: RedisClientType): Promise<boolean> {
   const luaEval = `
     if redis.call("get", KEYS[1]) == ARGV[1] then
       return redis.call("pexpire", KEYS[1], ARGV[2])
@@ -84,8 +84,10 @@ export async function renew(lock: Lock, ttl: number, redisClient: RedisClientTyp
   });
 
   if (result === 0) {
-    throw new Error(`Failed to renew lock for resource ${lock.resourceName}.`);
+    return false; // Lock not renewed
   }
+
+  return true; // Lock renewed
 }
 
 export async function executeJob(jobExecution: JobExecution): Promise<void> {
@@ -112,13 +114,13 @@ export async function executeJob(jobExecution: JobExecution): Promise<void> {
   try {
     const jobPromise = job(params, abortController.signal);
     renewInterval = setInterval(async () => {
-      try {
-        await renew(lock, ttl, redisClient);
-        console.log(`Lock renewed for resource: ${resourceName}.`);
-      } catch (error) {
-        console.error(`Failed to renew lock for resource: ${resourceName}.`, error);
+      const renewed = await renew(lock, ttl, redisClient);
+      if (!renewed) {
+        console.log(`Lock lost for resource: ${resourceName}. Aborting job...`);
         clearInterval(renewInterval);
         abortController.abort();
+      } else {
+        console.log(`Lock renewed for resource: ${resourceName}.`);
       }
     }, ttl / 2);
 
@@ -149,4 +151,99 @@ export async function executeJob(jobExecution: JobExecution): Promise<void> {
       console.log(`Lock was already lost for resource: ${resourceName}.`);
     }
   }
+}  
+
+export async function runForLeader(resourceName: string, ttl: number, redisClient: RedisClientType): Promise<void> {
+  // let's keep a renew interval to renew the execution. if the process is not the leader, it should still be running as a backup to take up as leader if the leader fails. This is a common pattern in distributed systems to ensure high availability.
+  let lock: Lock | null = null;
+  let renewInterval: NodeJS.Timeout | undefined;
+
+  function stopRenewInterval(): void {
+    if (renewInterval) {
+      clearInterval(renewInterval);
+      renewInterval = undefined;
+    }
+  }
+
+  function startRenewInterval(): NodeJS.Timeout {
+    return setInterval(async () => {
+      if (!lock) {
+        return;
+      }
+
+      try {
+        const renewal = await renew(lock, ttl, redisClient);
+
+        if (renewal) {
+          console.log(
+            `Renewed leadership for resource: ${resourceName}.`,
+          );
+        } else {
+          console.log(
+            `Failed to renew leadership for resource: ${resourceName}. Lock may have been lost.`,
+          );
+
+          stopRenewInterval();
+          lock = null;
+        }
+      } catch (error) {
+        console.error(
+          `Failed to renew leadership for resource: ${resourceName}.`,
+          error,
+        );
+
+        stopRenewInterval();
+        lock = null;
+      }
+    }, ttl / 3);
+  }
+
+  while (true) {
+    try {
+      if (!lock) {
+        lock = await acquire(`leader:${resourceName}`, ttl, redisClient);
+        if (!lock) {
+          console.log(`Resource ${resourceName} is already locked. Waiting for leadership...`);
+        } else {
+          renewInterval = startRenewInterval();
+          console.log(`Acquired leadership for resource: ${resourceName}.`);
+        }
+
+      } else {
+        console.log(`Already holding leadership for resource: ${resourceName}. Continuing execution...`);
+        await executeJob({
+          resourceName,
+          ttl,
+          job: async (params, signal) => {
+            // Simulate a long-running job
+            for (let i = 0; i < 15; i++) {
+              if (signal.aborted) {
+                console.log(`Job for resource ${resourceName} was aborted.`);
+                return;
+              }
+              console.log(`Executing job for resource ${resourceName}: step ${i + 1}`);
+              await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate work
+            }
+          },
+          params: {},
+          redisClient,
+        });
+      }
+    } catch (error) {
+      console.error(`Error during leadership execution for resource ${resourceName}:`, error);
+      if (lock) {
+        const released = await release(lock, redisClient);
+        if (released) {
+          console.log(`Lock released for resource: ${resourceName} due to error.`);
+        } else {
+          console.log(`Lock was already lost for resource: ${resourceName} due to error.`);
+        }
+        stopRenewInterval();
+        lock = null;
+      }
+    }
+
+    await new Promise(resolve => setTimeout(resolve, ttl / 2)); // Wait before next attempt
+  }
+  
 }

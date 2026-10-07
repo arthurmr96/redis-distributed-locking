@@ -1,5 +1,5 @@
 import { createClient } from "redis";
-import { executeJob } from "./helpers";
+import { runForLeader } from "./helpers";
 
 async function main(): Promise<void> {
   const client = createClient({
@@ -13,38 +13,9 @@ async function main(): Promise<void> {
   try {
     await client.connect();
     const resourceName = "my-resource";
-    const job = async (params: Record<string, unknown>, signal: AbortSignal): Promise<void> => {
-      console.log(`Job started with params: ${JSON.stringify(params)}`);
+    const ttl = 10000; // 10 seconds
 
-      for (let step = 0; step < 15; step++) {
-        if (signal.aborted) {
-          console.log("Job stopped because the lock was lost.");
-          return;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-
-        if (signal.aborted) {
-          console.log("Job stopped because the lock was lost.");
-          return;
-        }
-
-        console.log(`Job progress: ${step + 1}/15`);
-      }
-
-      console.log("Job completed.");
-    };
-
-    const jobExecution = {
-      resourceName,
-      ttl: 10000, // Lock TTL in milliseconds
-      job,
-      params: { key: "value" },
-      redisClient: client,
-    };
-
-    await executeJob(jobExecution);
-    
+    await runForLeader(resourceName, ttl, client);
   }
   catch (error: unknown) {
     console.error(error)
